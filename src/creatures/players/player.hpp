@@ -882,6 +882,9 @@ public:
 
 	void drainHealth(const std::shared_ptr<Creature> &attacker, int32_t damage) override;
 	void drainMana(const std::shared_ptr<Creature> &attacker, int32_t manaLoss) override;
+	void applyDamageSmoothing(const std::shared_ptr<Creature> &attacker, CombatDamage &damage);
+	void processDamageSmoothingOverflow();
+	void cancelDamageSmoothing();
 	void addManaSpent(uint64_t amount);
 	void addSkillAdvance(skills_t skill, uint64_t count);
 	int32_t getSkill(skills_t skilltype, SkillsId_t skillinfo) const;
@@ -1817,6 +1820,22 @@ private:
 	bool m_hasSpellAim = false;
 	int64_t m_manaBufferTaxTime = 0;
 	bool m_manaBufferSurvived = false; // transient: Mana Buffer absorbed a lethal hit this combatChangeHealth pass
+
+	struct DamageWindowEntry {
+		int64_t timestamp = 0;
+		int32_t damage = 0;
+	};
+
+	struct DamageOverflowEntry {
+		std::weak_ptr<Creature> attacker;
+		CombatDamage damage;
+		int64_t lastTick = 0;
+		int64_t endTime = 0;
+	};
+
+	std::deque<DamageWindowEntry> m_damageSmoothingWindow;
+	std::deque<DamageOverflowEntry> m_damageSmoothingOverflow;
+	uint64_t m_damageSmoothingEvent = 0;
 
 	time_t lastLoginSaved = 0;
 	time_t lastLogout = 0;

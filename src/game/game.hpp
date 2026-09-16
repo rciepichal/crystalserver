@@ -549,6 +549,7 @@ public:
 	int32_t applyHealthChange(const CombatDamage &damage, const std::shared_ptr<Creature> &target) const;
 
 	bool combatChangeHealth(const std::shared_ptr<Creature> &attacker, const std::shared_ptr<Creature> &target, CombatDamage &damage, bool isEvent = false);
+	void applyDamageSmoothingOverflow(const std::shared_ptr<Creature> &attacker, const std::shared_ptr<Player> &target, CombatDamage damage);
 	void applyOffensiveCharmRune(const std::shared_ptr<Monster> &targetMonster, const std::shared_ptr<Player> &attackerPlayer, const std::shared_ptr<Creature> &target, const int32_t &realDamage) const;
 	void applyManaLeech(
 		const std::shared_ptr<Player> &attackerPlayer, const std::shared_ptr<Monster> &targetMonster,

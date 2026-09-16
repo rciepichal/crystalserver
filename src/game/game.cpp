@@ -8280,6 +8280,10 @@ bool Game::combatChangeHealth(const std::shared_ptr<Creature> &attacker, const s
 			applyPvPDamage(damage, attackerPlayer, targetPlayer);
 		}
 
+		if (targetPlayer && attackerMonster) {
+			targetPlayer->applyDamageSmoothing(attacker, damage);
+		}
+
 		auto targetHealth = target->getHealth();
 		realDamage = std::min<int32_t>(targetHealth, damage.primary.value + damage.secondary.value);
 		if (realDamage == 0) {
@@ -8344,6 +8348,51 @@ bool Game::combatChangeHealth(const std::shared_ptr<Creature> &attacker, const s
 	}
 
 	return true;
+}
+
+void Game::applyDamageSmoothingOverflow(const std::shared_ptr<Creature> &attacker, const std::shared_ptr<Player> &target, CombatDamage damage) {
+	if (!target || target->isRemoved() || !target->isAlive()) {
+		return;
+	}
+
+	int32_t realDamage = damage.primary.value + damage.secondary.value;
+	if (realDamage <= 0) {
+		return;
+	}
+
+	const int32_t targetHealth = target->getHealth();
+	realDamage = std::min(realDamage, targetHealth);
+	if (realDamage >= targetHealth) {
+		for (const auto &creatureEvent : target->getCreatureEvents(CREATURE_EVENT_PREPAREDEATH)) {
+			if (!creatureEvent->executeOnPrepareDeath(target, attacker, std::ref(realDamage))) {
+				return;
+			}
+		}
+	}
+
+	int32_t healthBeforeSpecialHandling = applyHealthChange(damage, target);
+	if (target->consumeManaBufferSurvived()) {
+		realDamage = std::max<int32_t>(0, target->getHealth() - 1);
+	}
+	if (damage.primary.value >= healthBeforeSpecialHandling) {
+		damage.primary.value = healthBeforeSpecialHandling;
+		damage.secondary.value = 0;
+	} else if (damage.secondary.value) {
+		damage.secondary.value = std::min<int32_t>(damage.secondary.value, healthBeforeSpecialHandling - damage.primary.value);
+	}
+
+	if (realDamage <= 0) {
+		return;
+	}
+
+	const Position targetPos = target->getPosition();
+	auto spectators = Spectators().find<Player>(targetPos, true);
+	target->drainHealth(attacker, realDamage);
+	addCreatureHealth(spectators.data(), target);
+
+	TextMessage message;
+	message.position = targetPos;
+	sendDamageMessageAndEffects(attacker, target, damage, targetPos, attacker ? attacker->getPlayer() : nullptr, target, message, spectators.data(), realDamage);
 }
 
 void Game::updatePlayerPartyHuntAnalyzer(const CombatDamage &damage, const std::shared_ptr<Player> &player) const {

@@ -83,6 +83,13 @@
 #include "creatures/combat/spells.hpp"
 #include "utils/tools.hpp"
 
+namespace {
+constexpr int64_t DAMAGE_SMOOTHING_WINDOW_MS = 500;
+constexpr double DAMAGE_SMOOTHING_MAX_BURST_PERCENT = 0.35;
+constexpr int64_t DAMAGE_SMOOTHING_OVERFLOW_DURATION_MS = 2000;
+constexpr uint32_t DAMAGE_SMOOTHING_TICK_MS = 200;
+}
+
 MuteCountMap Player::muteCountMap;
 
 Player::Player(std::shared_ptr<ProtocolGame> p) :
@@ -3518,6 +3525,132 @@ void Player::drainHealth(const std::shared_ptr<Creature> &attacker, int32_t dama
 	sendStats();
 }
 
+void Player::applyDamageSmoothing(const std::shared_ptr<Creature> &attacker, CombatDamage &damage) {
+	const int32_t incomingDamage = damage.primary.value + damage.secondary.value;
+	if (incomingDamage <= 0) {
+		return;
+	}
+
+	const int64_t now = OTSYS_TIME();
+	while (!m_damageSmoothingWindow.empty() && m_damageSmoothingWindow.front().timestamp <= now - DAMAGE_SMOOTHING_WINDOW_MS) {
+		m_damageSmoothingWindow.pop_front();
+	}
+
+	int32_t windowDamage = 0;
+	for (const auto &entry : m_damageSmoothingWindow) {
+		windowDamage += entry.damage;
+	}
+
+	const int32_t maxBurstDamage = static_cast<int32_t>(std::floor(getMaxHealth() * DAMAGE_SMOOTHING_MAX_BURST_PERCENT));
+	const int32_t instantDamage = std::clamp(maxBurstDamage - windowDamage, 0, incomingDamage);
+	if (instantDamage > 0) {
+		m_damageSmoothingWindow.push_back({ now, instantDamage });
+	}
+
+	if (instantDamage == incomingDamage) {
+		return;
+	}
+
+	CombatDamage overflowDamage = damage;
+	const int32_t instantPrimary = std::min(damage.primary.value, instantDamage);
+	const int32_t instantSecondary = instantDamage - instantPrimary;
+	overflowDamage.primary.value -= instantPrimary;
+	overflowDamage.secondary.value -= instantSecondary;
+	damage.primary.value = instantPrimary;
+	damage.secondary.value = instantSecondary;
+
+	m_damageSmoothingOverflow.push_back({
+		.attacker = attacker,
+		.damage = std::move(overflowDamage),
+		.lastTick = now,
+		.endTime = now + DAMAGE_SMOOTHING_OVERFLOW_DURATION_MS,
+	});
+
+	g_game().addMagicEffect(getPosition(), CONST_ME_HOURGLASS);
+	int32_t totalOverflow = 0;
+	for (const auto &entry : m_damageSmoothingOverflow) {
+		totalOverflow += entry.damage.primary.value + entry.damage.secondary.value;
+	}
+	sendTextMessage(MESSAGE_STATUS, fmt::format("Staggered damage: {} over 2.0 seconds.", totalOverflow));
+
+	if (m_damageSmoothingEvent == 0) {
+		m_damageSmoothingEvent = g_dispatcher().scheduleEvent(
+			DAMAGE_SMOOTHING_TICK_MS,
+			[self = std::weak_ptr<Player>(static_self_cast<Player>())] {
+				if (const auto player = self.lock()) {
+					player->processDamageSmoothingOverflow();
+				}
+			},
+			"Player::processDamageSmoothingOverflow"
+		);
+	}
+}
+
+void Player::processDamageSmoothingOverflow() {
+	m_damageSmoothingEvent = 0;
+	if (isRemoved() || getHealth() <= 0) {
+		cancelDamageSmoothing();
+		return;
+	}
+
+	const int64_t now = OTSYS_TIME();
+	for (auto it = m_damageSmoothingOverflow.begin(); it != m_damageSmoothingOverflow.end();) {
+		const int32_t remainingDamage = it->damage.primary.value + it->damage.secondary.value;
+		if (remainingDamage <= 0) {
+			it = m_damageSmoothingOverflow.erase(it);
+			continue;
+		}
+
+		const int64_t remainingTime = std::max<int64_t>(1, it->endTime - it->lastTick);
+		const int64_t elapsed = std::clamp<int64_t>(now - it->lastTick, 0, remainingTime);
+		int32_t tickDamage = now >= it->endTime ? remainingDamage : static_cast<int32_t>((static_cast<int64_t>(remainingDamage) * elapsed) / remainingTime);
+		if (tickDamage <= 0) {
+			++it;
+			continue;
+		}
+
+		CombatDamage tick = it->damage;
+		tick.primary.value = static_cast<int32_t>((static_cast<int64_t>(tickDamage) * it->damage.primary.value) / remainingDamage);
+		tick.secondary.value = tickDamage - tick.primary.value;
+		it->damage.primary.value -= tick.primary.value;
+		it->damage.secondary.value -= tick.secondary.value;
+		it->lastTick = now;
+
+		g_game().applyDamageSmoothingOverflow(it->attacker.lock(), static_self_cast<Player>(), std::move(tick));
+		if (getHealth() <= 0 || isRemoved()) {
+			cancelDamageSmoothing();
+			return;
+		}
+
+		if (it->damage.primary.value + it->damage.secondary.value == 0) {
+			it = m_damageSmoothingOverflow.erase(it);
+		} else {
+			++it;
+		}
+	}
+
+	if (!m_damageSmoothingOverflow.empty()) {
+		m_damageSmoothingEvent = g_dispatcher().scheduleEvent(
+			DAMAGE_SMOOTHING_TICK_MS,
+			[self = std::weak_ptr<Player>(static_self_cast<Player>())] {
+				if (const auto player = self.lock()) {
+					player->processDamageSmoothingOverflow();
+				}
+			},
+			"Player::processDamageSmoothingOverflow"
+		);
+	}
+}
+
+void Player::cancelDamageSmoothing() {
+	if (m_damageSmoothingEvent != 0) {
+		g_dispatcher().stopEvent(m_damageSmoothingEvent);
+		m_damageSmoothingEvent = 0;
+	}
+	m_damageSmoothingWindow.clear();
+	m_damageSmoothingOverflow.clear();
+}
+
 void Player::drainMana(const std::shared_ptr<Creature> &attacker, int32_t manaLoss) {
 	Creature::drainMana(attacker, manaLoss);
 	sendStats();
@@ -4028,6 +4161,8 @@ void Player::doAttacking(uint32_t interval) {
 }
 
 void Player::death(const std::shared_ptr<Creature> &lastHitCreature) {
+	cancelDamageSmoothing();
+
 	if (!g_configManager().getBoolean(TOGGLE_MOUNT_IN_PZ) && isMounted()) {
 		dismount();
 		g_game().internalCreatureChangeOutfit(getPlayer(), defaultOutfit);
@@ -11569,6 +11704,8 @@ void Player::onRemoveCreature(const std::shared_ptr<Creature> &creature, bool is
 	Creature::onRemoveCreature(creature, isLogout);
 
 	if (const auto &player = getPlayer(); player == creature) {
+		cancelDamageSmoothing();
+
 		if (isLogout) {
 			onDeEquipInventory();
 
